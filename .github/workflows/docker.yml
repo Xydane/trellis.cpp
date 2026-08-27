@@ -42,16 +42,25 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
 
-      # The GitHub runner has 16 GB RAM but no swap. Shader generation in
-      # ggml-vulkan forks a lot of glslc processes, and a failed fork() is only
-      # warned about (then surfaces as thousands of undefined-reference link
-      # errors), so add swap as headroom on top of the Dockerfile's -j capping.
+      # Extra swap as headroom for the fork-heavy Vulkan shader generation (a
+      # failed fork() is only warned about and then surfaces as thousands of
+      # undefined-reference link errors). The runner already has an active
+      # /swapfile, so use our own file and keep the whole step best-effort --
+      # the Dockerfile's -j capping is the actual fix, this is only headroom.
       - name: Add swap
+        continue-on-error: true
         run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          set -x
+          if ! swapon --show=NAME --noheadings | grep -qx /mnt/ci-swapfile; then
+            sudo rm -f /mnt/ci-swapfile
+            # /mnt is the runner's large ephemeral disk.
+            sudo fallocate -l 8G /mnt/ci-swapfile \
+              || sudo dd if=/dev/zero of=/mnt/ci-swapfile bs=1M count=8192 status=none
+            sudo chmod 600 /mnt/ci-swapfile
+            sudo mkswap /mnt/ci-swapfile
+            sudo swapon /mnt/ci-swapfile
+          fi
+          swapon --show
           free -h
 
       - uses: docker/setup-buildx-action@v3
