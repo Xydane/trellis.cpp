@@ -42,6 +42,18 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
 
+      # The GitHub runner has 16 GB RAM but no swap. Shader generation in
+      # ggml-vulkan forks a lot of glslc processes, and a failed fork() is only
+      # warned about (then surfaces as thousands of undefined-reference link
+      # errors), so add swap as headroom on top of the Dockerfile's -j capping.
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR

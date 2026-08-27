@@ -23,6 +23,7 @@ FROM ubuntu:26.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CMAKE_BUILD_TYPE=Release
+# Leave empty to auto-pick a memory-aware job count (see below).
 ARG BUILD_JOBS=
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,11 +49,56 @@ COPY . /src
 RUN test -f thirdparty/ggml/CMakeLists.txt \
     || { echo "ERROR: thirdparty/ggml is empty. Run: git submodule update --init --recursive"; exit 1; }
 
-RUN cmake -B build -G Ninja \
+# ggml's vulkan-shaders-gen forks up to 16 concurrent glslc children *per ninja
+# job*, and ninja runs many shader-gen steps at once, so the real fan-out is
+# jobs x 16. When that exhausts RAM, fork() fails with ENOMEM and the generator
+# only *warns* ("Cannot allocate memory" / "Failed to fork process") and skips
+# the shader -- but it still emits the extern declaration, so the build dies much
+# later with thousands of confusing "undefined reference to matmul_..._cm1_len"
+# link errors. Cap the job count against available memory to keep fork() alive.
+#
+# /proc/meminfo reports the *host* totals inside a container, so honour the
+# cgroup limit (v2 memory.max, then v1 limit_in_bytes) when one is set.
+RUN set -eux; \
+    jobs="${BUILD_JOBS:-}"; \
+    if [ -z "$jobs" ]; then \
+        mem_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo); \
+        for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do \
+            if [ -r "$f" ]; then \
+                lim=$(cat "$f"); \
+                case "$lim" in \
+                    ''|max|*[!0-9]*) ;; \
+                    *) lim_kb=$(( lim / 1024 )); \
+                       [ "$lim_kb" -lt "$mem_kb" ] && mem_kb="$lim_kb" ;; \
+                esac; \
+            fi; \
+        done; \
+        # ~1 job per 2 GiB: covers both a forking glslc fan-out and a big cc1plus.
+        jobs=$(( mem_kb / 2097152 )); \
+        [ "$jobs" -lt 1 ] && jobs=1; \
+        [ "$jobs" -gt "$(nproc)" ] && jobs=$(nproc); \
+    fi; \
+    echo "building with -j${jobs} (mem_kb=${mem_kb:-n/a}, nproc=$(nproc))"; \
+    cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
         -DGGML_VULKAN=ON \
-        -DGGML_NATIVE=OFF \
-    && cmake --build build --target trellis-server trellis-cli ${BUILD_JOBS:+-j ${BUILD_JOBS}}
+        -DGGML_NATIVE=OFF; \
+    # Phase 1: the shader generation, throttled hard. Each ninja step here spawns
+    # a vulkan-shaders-gen that itself forks up to 16 glslc children, so keep the
+    # outer width small; this is the step that ran out of memory.
+    shader_jobs=2; \
+    [ "$jobs" -lt 2 ] && shader_jobs="$jobs"; \
+    cmake --build build --target ggml-vulkan -j "${shader_jobs}"; \
+    # Phase 2: ordinary C++ compilation, full width.
+    cmake --build build --target trellis-server trellis-cli -j "${jobs}"
+
+# Guard against the silent-skip failure mode above: every shader the generated
+# header declares must also have a definition in the generated source.
+RUN set -eu; \
+    gen=build/thirdparty/ggml/src/ggml-vulkan; \
+    decl=$(grep -c '^extern const uint64_t' "$gen/ggml-vulkan-shaders.hpp"); \
+    echo "generated shader symbols declared: $decl"; \
+    test "$decl" -gt 2000 || { echo "ERROR: too few Vulkan shaders generated ($decl) -- shader generation was truncated"; exit 1; }
 
 # Stage the binaries + ggml shared libs and point their rpath at $ORIGIN so the
 # runtime image needs no LD_LIBRARY_PATH (mirrors the release packaging step).
