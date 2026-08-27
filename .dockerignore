@@ -1,0 +1,21 @@
+# Keep the build context small: everything the CMake build does not need.
+.git
+.github
+build/
+build-*/
+out/
+dumps/
+models/*
+!models/.gitkeep
+app/node_modules
+app/src-tauri/target
+tools/mv_preview/node_modules
+.venv
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+# Ignored by both podman (which falls back to .dockerignore) and buildx.
+*.glb
+Dockerfile
+.dockerignore

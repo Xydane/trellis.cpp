@@ -1,0 +1,87 @@
+name: Container image (Vulkan)
+
+# Builds the Vulkan-enabled image from ./Dockerfile and pushes it to GHCR as
+# ghcr.io/<owner>/trellis.cpp:latest on every push to main (plus a :sha-<sha>
+# tag so a bad "latest" can always be rolled back to an exact commit).
+on:
+  push:
+    branches: [main]
+    # Skip runs that cannot change the image. (assets/ is NOT ignored -- the
+    # runtime stage copies it in.)
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "app/**"
+      - "install/**"
+  workflow_dispatch:
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  image:
+    name: build & push (vulkan)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The image build compiles the vendored ggml submodule, so it must be
+      # present in the build context.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=long
+          labels: |
+            org.opencontainers.image.title=trellis.cpp (Vulkan)
+            org.opencontainers.image.description=trellis.cpp image-to-3D server/CLI built with the GGML Vulkan backend
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=vulkan
+          cache-to: type=gha,mode=max,scope=vulkan
+
+      - name: Smoke test the pushed image
+        run: |
+          set -e
+          img="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          docker run --rm "$img" trellis-cli --help | head -3
+          # No /dev/dri on the runner: this only asserts the Vulkan loader and
+          # ggml-vulkan resolve (Mesa llvmpipe answers as a software device).
+          docker run --rm "$img" vulkaninfo --summary | grep -A4 'Devices:'
