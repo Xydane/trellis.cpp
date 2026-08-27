@@ -99,10 +99,33 @@ jobs:
           cache-to: type=gha,mode=max,scope=vulkan
 
       - name: Smoke test the pushed image
+        env:
+          # metadata-action already lowercases the image name; github.repository
+          # keeps the owner's original case (Xydane), which docker rejects with
+          # "repository name must be lowercase". Reuse the computed tag.
+          IMG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
         run: |
-          set -e
-          img="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          docker run --rm "$img" trellis-cli --help | head -3
-          # No /dev/dri on the runner: this only asserts the Vulkan loader and
-          # ggml-vulkan resolve (Mesa llvmpipe answers as a software device).
-          docker run --rm "$img" vulkaninfo --summary | grep -A4 'Devices:'
+          set -euo pipefail
+          echo "testing $IMG"
+          # trellis-cli prints its usage to stderr, so fold stderr in -- otherwise
+          # the capture is empty and the check passes without asserting anything.
+          # Capture then filter: piping straight into head can SIGPIPE the docker
+          # process and trip pipefail.
+          out=$(docker run --rm "$IMG" trellis-cli --help 2>&1)
+          printf '%s\n' "$out" | head -3
+          printf '%s\n' "$out" | grep -q 'usage: trellis-cli'
+          # Same for the server binary: it must at least start and print usage.
+          docker run --rm "$IMG" trellis-server --help 2>&1 | grep -q 'usage:'
+          # No /dev/dri on the runner, so this only asserts that the Vulkan
+          # loader and ggml-vulkan resolve (Mesa llvmpipe answers as a software
+          # device); it is not a GPU test.
+          info=$(docker run --rm "$IMG" vulkaninfo --summary 2>/dev/null)
+          printf '%s\n' "$info" | grep -A4 'Devices:'
+          # Guard against a runtime image that is missing the ggml libs.
+          docker run --rm "$IMG" sh -c 'ldd /opt/trellis/trellis-cli' > /tmp/ldd.txt
+          if grep -q 'not found' /tmp/ldd.txt; then
+            echo 'ERROR: unresolved shared libraries:'; grep 'not found' /tmp/ldd.txt; exit 1
+          fi
+          grep -q libggml-vulkan /tmp/ldd.txt \
+            || { echo 'ERROR: trellis-cli is not linked against ggml-vulkan'; exit 1; }
+          echo 'smoke test OK'
