@@ -108,6 +108,15 @@ add_library(trellis_core STATIC
   src/decimate_qem.cpp
 )
 target_include_directories(trellis_core PUBLIC include ${GGML_DIR}/include ${CMAKE_SOURCE_DIR}/thirdparty/stb ${CMAKE_SOURCE_DIR}/thirdparty/xatlas ${CMAKE_SOURCE_DIR}/thirdparty/meshoptimizer ${CMAKE_SOURCE_DIR}/thirdparty/fqms)
+
+# The QEM decimator is reproducibility-critical: its edge-collapse cost feeds a tie-break on
+# EXACT float equality, so any FMA contraction the host compiler applies here changes the output
+# topology and desyncs the CPU path from the CUDA/HIP kernel (pinned with --fmad=false below) and
+# from the Vulkan shader (pinned with `precise` in decimate_qem.comp). Applies to GCC/Clang; MSVC
+# does not contract by default.
+if(NOT MSVC)
+  set_source_files_properties(src/decimate_qem.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 target_compile_definitions(trellis_core PRIVATE TRELLIS_GIT_COMMIT="${TRELLIS_GIT_COMMIT}" TRELLIS_GIT_DIRTY=${TRELLIS_GIT_DIRTY} TRELLIS_BUILD_TIMESTAMP="${TRELLIS_BUILD_TIMESTAMP_UTC}" TRELLIS_APP_VERSION="${TRELLIS_APP_VERSION}")
 target_link_libraries(trellis_core PUBLIC ggml ggml-base ggml-cpu)
 
@@ -142,8 +151,27 @@ if(TARGET ggml-cuda)
   target_compile_definitions(trellis_core PUBLIC TRELLIS_USE_CUDA)
   target_link_libraries(trellis_core PUBLIC ggml-cuda)
   target_sources(trellis_core PRIVATE src/deform_conv.cu)
+  # Disable FMA contraction so the CUDA deform kernel matches the CPU port (and the Vulkan
+  # shader) bit-for-bit. nvcc contracts by default (--fmad=true: 4 fma.rn.f32 in this kernel);
+  # GCC/Clang do not contract unless -mfma/-march is passed, and -march=native is confined to
+  # ggml's CPU backend here, so the CPU port has no FMAs. That asymmetry made the BiRefNet matte
+  # backend-dependent: measured on a 64ch/64x64/K=3 case, 221329 of 262144 outputs differed
+  # (max 3.3e-6) with contraction on, and 0 of 262144 with it off. The matte then feeds a bbox
+  # reduction over `alpha > 0.8f` (preprocess.cpp), where a single flipped pixel moves the crop
+  # and rescales the whole conditioning image.
+  set_source_files_properties(src/deform_conv.cu PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
   # Self-contained CUDA QEM decimation (mirrors the CPU port; uses cub for scan/sort/RLE).
   target_sources(trellis_core PRIVATE src/decimate_qem.cu)
+  # Disable FMA contraction in the decimator so CUDA matches the CPU port bit-for-bit.
+  # The edge index breaks exact cost ties (pack_cost = cost<<32|id) and ties are the norm at
+  # thresh=1e-8, so a single ULP from a contracted a*b+c flips which edge wins a face and the
+  # meshes diverge structurally. Measured on a 500k-face torus: with edge ordering fixed but
+  # FMA left on, CPU 48694 faces vs GPU 46384 (4.74% apart); with --fmad=false plus the
+  # matching -ffp-contract=off on decimate_qem.cpp, both give 48694 and the vertex/index
+  # buffers are bit-identical.
+  set_source_files_properties(src/decimate_qem.cu PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
   if(MSVC)
     # CUDA 13.3 CCCL requires MSVC's conforming preprocessor for host compilation.
     target_compile_options(trellis_core PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")
@@ -162,6 +190,14 @@ else()
   # the CPU source there so deform_conv2d_run has a single definition.
   if(NOT TARGET ggml-hip)
     target_sources(trellis_core PRIVATE src/deform_conv_cpu.cpp)
+  endif()
+  # Pin FMA contraction off on the CPU deform kernel. GCC/Clang do not contract at -O2/-O3
+  # without -mfma or -march=..., so today this is a no-op that documents the requirement and
+  # keeps the kernel matching the GPU ports (pinned with --fmad=false / -ffp-contract=off) if
+  # anyone later adds arch flags to trellis_core. Set unconditionally: the file is also the
+  # Vulkan path's fallback, and both must agree with the shader.
+  if(NOT MSVC)
+    set_source_files_properties(src/deform_conv_cpu.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
   endif()
   if(TARGET ggml-vulkan)
     set(TRELLIS_BUILD_BACKEND "vulkan")
@@ -194,6 +230,11 @@ else()
       COMMENT "glslc decimate_qem.comp -> SPIR-V (C array)")
     add_custom_target(trellis_decimate_spv DEPENDS ${DECIMATE_SPV_H})
     target_sources(trellis_core PRIVATE src/decimate_qem_vk.cpp)
+    # Vulkan decimation host driver: same FMA pin as decimate_qem.cpp/.cu. It does the CSR
+    # adjacency and stream compaction on the host, so it must agree with the CPU port exactly.
+    if(NOT MSVC)
+      set_source_files_properties(src/decimate_qem_vk.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
     add_dependencies(trellis_core trellis_decimate_spv)
     # Target-level so the dispatch block in decimate_qem.cpp is active too (mirrors how the CUDA
     # path defines TRELLIS_HAVE_GPU_DECIMATE for the whole library).
@@ -246,6 +287,10 @@ if(TARGET ggml-hip)
   # Both the QEM decimation kernel and BiRefNet's deformable conv (issue #20) build
   # as HIP so ROCm users get GPU BiRefNet instead of the minutes-long CPU fallback.
   set_source_files_properties(src/decimate_qem.cu src/deform_conv.cu PROPERTIES LANGUAGE HIP)
+  # Same FMA-contraction pin as the CUDA branch (see the comments there): keeps the HIP
+  # decimator and deform kernel bit-identical to the CPU ports.
+  set_source_files_properties(src/decimate_qem.cu src/deform_conv.cu PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>")
   target_sources(trellis_core PRIVATE src/decimate_qem.cu src/deform_conv.cu)
   target_compile_definitions(trellis_core PUBLIC TRELLIS_HAVE_GPU_DECIMATE)
   target_include_directories(trellis_core PRIVATE ${ROCM_PATH}/include)
@@ -305,6 +350,22 @@ set_target_properties(trellis-test-preprocess PROPERTIES BUILD_RPATH "${GGML_RPA
 add_executable(trellis-test-deform src/test_deform.cpp)
 target_link_libraries(trellis-test-deform PRIVATE trellis_core)
 set_target_properties(trellis-test-deform PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+# deform_conv_cpu.cpp is only compiled on the Vulkan/CPU paths (a CUDA or HIP build gets
+# deform_conv2d_run from deform_conv.cu instead), so --selftest can only compare GPU against
+# CPU there. Tell the test which case it is in rather than failing to link.
+if(NOT TARGET ggml-cuda AND NOT TARGET ggml-hip)
+  target_compile_definitions(trellis-test-deform PRIVATE TRELLIS_HAVE_DEFORM_CPU)
+endif()
+
+# CPU-vs-GPU decimation regression + the GPU determinism check. Built only with a CUDA/HIP
+# kernel, since it calls decimate_qem_gpu() directly. Its CPU reference side goes through
+# decimate_qem_cpu(), which never dispatches to a GPU port, so the two implementations are
+# genuinely compared rather than the GPU against itself.
+if(TARGET ggml-cuda OR TARGET ggml-hip)
+  add_executable(trellis-test-decimate src/test_decimate.cpp)
+  target_link_libraries(trellis-test-decimate PRIVATE trellis_core)
+  set_target_properties(trellis-test-decimate PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+endif()
 
 add_executable(trellis-test-ss-dec src/test_ss_dec.cpp)
 target_link_libraries(trellis-test-ss-dec PRIVATE trellis_core)

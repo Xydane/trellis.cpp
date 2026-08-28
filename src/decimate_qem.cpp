@@ -93,6 +93,16 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
         if (kv.second == 1) { boundary[a] = boundary[b] = 1; }
         edges.push_back(kv.first);
     }
+    // LOAD-BEARING for cross-backend reproducibility: the edge INDEX is the tie-break in
+    // pack_cost (cost<<32|id), and exact cost ties are the norm at thresh=1e-8 on a
+    // dual-contoured mesh (co-planar regions give identical quadric error; equal-length
+    // axis-aligned edges give identical lam_len*|e|^2). Iterating `ecount` yields hash-bucket
+    // order -- unspecified, and it shifts with the STL/bucket history -- so the independent set
+    // that won round 1 differed between this path, the CUDA path (whose cub radix sort already
+    // produces ascending packed order) and the Vulkan path, and the meshes then diverged
+    // structurally and never reconverged. Sorting by the packed key (min<<32|max) makes the
+    // index a canonical function of the edge, matching cub, on every backend.
+    std::sort(edges.begin(), edges.end());
     const int E = (int)edges.size();
 
     // per-vertex QEM = sum of incident face plane quadrics (normalized normals)
@@ -210,17 +220,22 @@ void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<
 #ifdef TRELLIS_HAVE_GPU_DECIMATE
     // Run the whole simplification on the GPU when a CUDA/HIP backend is built in; on any
     // failure (no device, alloc/kernel error) fall through to the validated CPU path.
-    if (decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
+    // TRELLIS_DECIMATE_CPU=1 forces the CPU path -- the A/B switch for attributing a mesh
+    // difference to the decimator vs the ggml decoder upstream (see also decimate_qem_cpu()).
+    if (!getenv("TRELLIS_DECIMATE_CPU") &&
+        decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
     // Any message above (e.g. "device kernel image is invalid" when the kernel was
     // built for a different GPU arch — issue #14) is non-fatal: the mesh is still
     // decimated correctly on the CPU below, just slower.
-    fprintf(stderr, "[decimate] GPU decimation unavailable; falling back to the CPU path (output is unaffected)\n");
+    if (!getenv("TRELLIS_DECIMATE_CPU"))
+        fprintf(stderr, "[decimate] GPU decimation unavailable; falling back to the CPU path (output is unaffected)\n");
 #endif
 
 #ifdef TRELLIS_HAVE_VK_DECIMATE
     // Same, on a headless Vulkan compute device (used in Vulkan-only builds with no CUDA/HIP
     // kernel). Falls through to the CPU path on any failure or when the device lacks 64-bit atomics.
-    if (decimate_qem_vk(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
+    if (!getenv("TRELLIS_DECIMATE_CPU") &&
+        decimate_qem_vk(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
 #endif
 
     float thresh = 1e-8f;
@@ -244,6 +259,39 @@ void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<
     of.resize((size_t)F * 3);
     for (int f = 0; f < F; ++f) for (int k = 0; k < 3; ++k) of[3*f+k] = used[faces[3*f+k]];
     printf("  decimate_qem(target=%d): V %d->%d, F %d->%d (thresh=%.1e)\n", target_faces, V0, nV, F0, F, (double)thresh);
+    fflush(stdout);
+}
+
+// Pure-CPU entry point, bypassing any GPU dispatch. Used by trellis-test-decimate as the
+// reference side of the CPU-vs-GPU comparison (linking trellis_core would otherwise route
+// decimate_qem() straight back to the GPU and compare the GPU against itself).
+void decimate_qem_cpu(const std::vector<float>& in_verts, int V0, const std::vector<int32_t>& in_faces, int F0,
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of) {
+    std::vector<float> verts = in_verts;
+    std::vector<int32_t> faces = in_faces;
+    int V = V0, F = F0;
+    if (F <= target_faces) { ov = verts; of = faces; return; }
+
+    float thresh = 1e-8f;
+    const float lam_len = 1e-2f, lam_skinny = 1e-3f;
+    int prevF = F, stalls = 0;
+    for (int round = 0; round < 400 && F > target_faces; ++round) {
+        simplify_round(verts, V, faces, F, lam_len, lam_skinny, thresh);
+        if (F <= target_faces) break;
+        int removed = prevF - F;
+        if (removed <= 0) { if (++stalls >= 2) { thresh *= 10.0f; stalls = 0; } }
+        else { stalls = 0; if ((float)removed / prevF < 1e-2f) thresh *= 10.0f; }
+        prevF = F;
+        if (thresh > 1e12f) break;
+    }
+
+    std::vector<int> used((size_t)V, -1); int nV = 0;
+    for (int f = 0; f < F; ++f) for (int k = 0; k < 3; ++k) { int v = faces[3*f+k]; if (used[v] < 0) used[v] = nV++; }
+    ov.assign((size_t)nV * 3, 0.f);
+    for (int i = 0; i < V; ++i) if (used[i] >= 0) { ov[3*used[i]] = verts[3*i]; ov[3*used[i]+1] = verts[3*i+1]; ov[3*used[i]+2] = verts[3*i+2]; }
+    of.resize((size_t)F * 3);
+    for (int f = 0; f < F; ++f) for (int k = 0; k < 3; ++k) of[3*f+k] = used[faces[3*f+k]];
+    printf("  decimate_qem_cpu(target=%d): V %d->%d, F %d->%d (thresh=%.1e)\n", target_faces, V0, nV, F0, F, (double)thresh);
     fflush(stdout);
 }
 

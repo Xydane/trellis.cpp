@@ -12,6 +12,15 @@
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
+// Numerics parity with decimate_qem.cu / decimate_qem.cpp. GLSL's length() and clamp() are
+// allowed a different precision than an explicit sqrt(dot(v,v)) / fminf(fmaxf(..)), and with
+// glslc -O plus driver fast-math the compiler may also contract these expressions into FMAs
+// that the CUDA and CPU builds do not get. Since the edge index breaks exact cost ties, an ULP
+// of drift here flips which edge wins a face and changes the output topology -- so spell the
+// operations out the same way the C/CUDA code does and mark the accumulators `precise` to block
+// reassociation/contraction.
+float len3(vec3 v) { precise float d = dot(v, v); return sqrt(d); }
+
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
@@ -46,9 +55,10 @@ void qem_add_plane(inout float e[10], vec3 n, float d) {
     e[7]+=n.z*n.z; e[8]+=n.z*d;   e[9]+=d*d;
 }
 float qem_eval(float e[10], vec3 p) {
-    return e[0]*p.x*p.x + 2.0*e[1]*p.x*p.y + 2.0*e[2]*p.x*p.z + 2.0*e[3]*p.x
-         + e[4]*p.y*p.y + 2.0*e[5]*p.y*p.z + 2.0*e[6]*p.y
-         + e[7]*p.z*p.z + 2.0*e[8]*p.z     + e[9];
+    precise float r = e[0]*p.x*p.x + 2.0*e[1]*p.x*p.y + 2.0*e[2]*p.x*p.z + 2.0*e[3]*p.x
+                    + e[4]*p.y*p.y + 2.0*e[5]*p.y*p.z + 2.0*e[6]*p.y
+                    + e[7]*p.z*p.z + 2.0*e[8]*p.z     + e[9];
+    return r;
 }
 
 uint64_t pack_cost(int id, float c) {
@@ -65,11 +75,13 @@ bool process(int keep, int other, vec3 vn, inout float skinny, inout int ntri) {
         vec3 on = cross(b-a, c-a);
         vec3 ne1 = nb-na, ne2 = nc-na, nn = cross(ne1, ne2);
         if (dot(on, nn) < 0.0) return false;
-        float narea = 0.5 * length(nn);
+        float narea = 0.5 * len3(nn);
         float denom = dot(nc-nb, nc-nb) + dot(ne1, ne1) + dot(ne2, ne2);
-        denom = max(denom, 1e-12);
+        // Branch, not max(): matches the `if (denom < 1e-12f) denom = 1e-12f;` in the CPU/CUDA
+        // paths, which differs from max() on a NaN denom.
+        if (denom < 1e-12) denom = 1e-12;
         float sm = 4.0 * 1.7320508 * narea / denom;
-        skinny += 1.0 - clamp(sm, 0.0, 1.0);
+        skinny += 1.0 - min(max(sm, 0.0), 1.0);   // min(max()) order matches fminf(fmaxf())
         ntri++;
     }
     return true;
@@ -85,7 +97,7 @@ void main() {
         for (int j = off[i]; j < off[i+1]; ++j) {
             int f = v2f[j];
             vec3 fa = vget(faces[3*f]), fb = vget(faces[3*f+1]), fc = vget(faces[3*f+2]);
-            vec3 n = cross(fb-fa, fc-fa); float ln = length(n); if (ln > 1e-20) n /= ln;
+            vec3 n = cross(fb-fa, fc-fa); float ln = len3(n); if (ln > 1e-20) n /= ln;
             qem_add_plane(e, n, -dot(n, fa));
         }
         for (int k = 0; k < 10; ++k) qem[10*i+k] = e[k];

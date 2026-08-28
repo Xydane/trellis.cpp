@@ -1,9 +1,10 @@
 // Standalone harness for decimate_qem: compares the validated CPU path against the
-// CUDA/HIP GPU port on a procedural 500x500 torus (500k faces), plus geometry sanity.
+// CUDA/HIP GPU port on a procedural 500x500 torus (500k faces), plus geometry sanity
+// and a GPU run-to-run determinism check.
 //   procedural: ./test_decimate <target>
 //   from dump:  ./test_decimate <mesh.bin> <target>   (bin = int V, int F, float[V*3], int[F*3])
-// Build this WITHOUT -DTRELLIS_HAVE_GPU_DECIMATE so `decimate_qem` stays the pure CPU
-// path; the GPU entry point `decimate_qem_gpu` (from decimate_qem.cu) is called directly.
+// The CPU reference goes through decimate_qem_cpu(), which never dispatches to a GPU port,
+// so this compares the two implementations rather than the GPU against itself.
 #include "uv_bake.h"
 #include <vector>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <unordered_map>
 
 namespace trellis {
@@ -119,7 +121,7 @@ int main(int argc, char** argv) {
     std::vector<float> ov_c; std::vector<int32_t> of_c;
     if (!skip_cpu) {
         std::printf("CPU decimate_qem:\n"); std::fflush(stdout);
-        trellis::decimate_qem(v, V, f, F, target, ov_c, of_c);
+        trellis::decimate_qem_cpu(v, V, f, F, target, ov_c, of_c);
         report("cpu", ov_c, of_c);
     }
 
@@ -138,6 +140,27 @@ int main(int argc, char** argv) {
     }
     if (skip_cpu) return 0;
 
+    // --- determinism: the same input must give bit-identical output on a second run ---
+    // Guards k_sort_v2f (decimate_qem.cu). k_fill_v2f fills each vertex's incident-face segment
+    // in atomicAdd ARRIVAL order; without the sort, k_qem summed the quadric floats in a
+    // run-varying order, fp32 addition is not associative, and the ULP of drift flipped which
+    // edge won a face (the edge index is the tie-break in the packed cost) -- so the mesh
+    // changed run-to-run on identical input.
+    {
+        std::vector<float> ov_g2; std::vector<int32_t> of_g2;
+        if (trellis::decimate_qem_gpu(v, V, f, F, target, ov_g2, of_g2)) {
+            const bool same = ov_g2.size() == ov_g.size() && of_g2.size() == of_g.size() &&
+                (ov_g.empty() || std::memcmp(ov_g2.data(), ov_g.data(), ov_g.size()*4) == 0) &&
+                (of_g.empty() || std::memcmp(of_g2.data(), of_g.data(), of_g.size()*4) == 0);
+            std::printf("determinism: run2 V=%d F=%d -> %s\n",
+                        (int)ov_g2.size()/3, (int)of_g2.size()/3, same ? "IDENTICAL" : "DIFFERS");
+            if (!same) {
+                std::printf("FAIL: GPU decimation is not deterministic across runs\n");
+                return 4;
+            }
+        }
+    }
+
     // --- comparison / pass criteria ---
     int Fc = (int)of_c.size()/3, Fg = (int)of_g.size()/3;
     MeshStats sg = analyze(ov_g, of_g);
@@ -147,11 +170,30 @@ int main(int argc, char** argv) {
     bool pass = true;
     if (!sg.finite)              { std::printf("FAIL: GPU mesh has non-finite vertices\n"); pass = false; }
     if (Fg > target * 11 / 10)   { std::printf("FAIL: GPU F above target+10%%\n"); pass = false; }
+    // The CPU and GPU ports are held to BIT-EQUALITY, not a ballpark. Both sort the edge list by
+    // the packed (min<<32|max) key so the tie-break index agrees, accumulate per-vertex quadrics
+    // in ascending face id (k_sort_v2f mirrors the serial CSR fill), and are built with FMA
+    // contraction disabled. If any of those three regresses, an ULP of cost drift flips which
+    // edge wins a face and the meshes diverge structurally -- which is exactly the bug this
+    // guards. Verified identical on a 500k-face torus at targets 10k/20k/50k.
+    const bool bitsame = ov_c.size() == ov_g.size() && of_c.size() == of_g.size() &&
+        (ov_c.empty() || std::memcmp(ov_c.data(), ov_g.data(), ov_c.size()*4) == 0) &&
+        (of_c.empty() || std::memcmp(of_c.data(), of_g.data(), of_c.size()*4) == 0);
+    std::printf("bit-equality CPU vs GPU: %s\n", bitsame ? "IDENTICAL" : "DIFFERS");
+    if (!bitsame) {
+        std::printf("FAIL: GPU output is not bit-identical to the CPU port\n");
+        if (ov_c.size() == ov_g.size()) {
+            double mx = 0;
+            for (size_t i = 0; i < ov_c.size(); ++i) mx = std::max(mx, (double)std::fabs(ov_c[i]-ov_g[i]));
+            std::printf("      max|dv|=%.3g (check: edge sort, k_sort_v2f, --fmad=false)\n", mx);
+        }
+        pass = false;
+    }
     if (df > 0.10f)              { std::printf("FAIL: GPU face count differs from CPU by >10%%\n"); pass = false; }
     // torus is closed: a clean simplification should stay (near-)watertight.
     long budget = (long)(Fg * 0.01) + 16;
     if (sg.open_edges > budget)  { std::printf("WARN: GPU open_edges=%ld (> ~1%% of F) -- not fully watertight\n", sg.open_edges); }
-    std::printf(pass ? "PASS: GPU matches CPU ballpark with clean geometry\n"
+    std::printf(pass ? "PASS: GPU is bit-identical to the CPU port, deterministic, geometry clean\n"
                      : "FAIL: see above\n");
     return pass ? 0 : 3;
 }

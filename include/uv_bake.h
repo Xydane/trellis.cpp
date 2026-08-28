@@ -53,6 +53,13 @@ void decimate_simplify(const std::vector<float>& verts, int V, const std::vector
 void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                   int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
 
+// Same algorithm, but always the CPU implementation -- never dispatches to the CUDA/HIP or
+// Vulkan port. The reference side of the CPU-vs-GPU comparison in trellis-test-decimate; also
+// reachable at runtime via TRELLIS_DECIMATE_CPU=1 on decimate_qem() above, which is the A/B
+// switch for attributing an output-mesh difference to the decimator vs the ggml decoder.
+void decimate_qem_cpu(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
+
 // Drop connected components (shared-vertex face adjacency) whose face count is below
 // frac*(largest component's). Removes decode floaters + spurious ground fragments (which
 // shatter our mesh into 50+ pieces) while keeping legitimately large secondary shells
