@@ -5,6 +5,14 @@
 
 layout(local_size_x = 256) in;
 
+// Numerics parity with deform_conv.cu / deform_conv_cpu.cpp. glslc -O plus driver fast-math may
+// contract a*b+c into an FMA, and the accumulator below is exactly the shape that invites it.
+// The CUDA kernel is built with --fmad=false and the CPU port with -ffp-contract=off, because
+// this output becomes the BiRefNet matte and feeds a bbox reduction over `alpha > 0.8f`
+// (preprocess.cpp) -- a single flipped pixel there moves the crop and rescales the whole
+// conditioning image. `precise` on the accumulator blocks reassociation/contraction so this
+// shader agrees with the other two.
+
 layout(push_constant) uniform PC {
     int Cin;
     int H;
@@ -31,7 +39,8 @@ float bilinear(uint base, int H, int W, float h, float w) {
     float v2 = (h_low >= 0   && w_high <= W - 1) ? x[base + uint(h_low  * W + w_high)] : 0.0;
     float v3 = (h_high <= H-1 && w_low >= 0)     ? x[base + uint(h_high * W + w_low)]  : 0.0;
     float v4 = (h_high <= H-1 && w_high <= W - 1) ? x[base + uint(h_high * W + w_high)] : 0.0;
-    return hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4;
+    precise float r = hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4;
+    return r;
 }
 
 void main() {
@@ -46,7 +55,7 @@ void main() {
     int ox = int(rem) % pc.W;
     int K2 = pc.K * pc.K;
 
-    float acc = (pc.hasBias != 0) ? bias[oc] : 0.0;
+    precise float acc = (pc.hasBias != 0) ? bias[oc] : 0.0;
     for (int ic = 0; ic < pc.Cin; ++ic) {
         uint xbase = uint(ic) * HW;
         uint wbase = (uint(oc) * uint(pc.Cin) + uint(ic)) * uint(K2);
