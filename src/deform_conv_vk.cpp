@@ -9,6 +9,7 @@
 #include "deform_conv.h"
 
 #include <vulkan/vulkan.h>
+#include "vk_device_pick.h"
 
 #include <chrono>
 #include <cstdint>
@@ -72,20 +73,10 @@ bool pick_device() {
     std::vector<VkPhysicalDevice> devs(n);
     vkEnumeratePhysicalDevices(g.instance, &n, devs.data());
 
-    int best_rank = -1;
-    VkDeviceSize best_heap = 0;
-    char best_name[256] = {0};
-    for (auto pd : devs) {
-        VkPhysicalDeviceProperties props;
-        vkGetPhysicalDeviceProperties(pd, &props);
-        // Never run on a software rasterizer (e.g. llvmpipe): it reports system RAM
-        // as a huge device-local heap and would win a size-only heuristic while being
-        // CPU-slow. Rank real GPUs first; tie-break by device-local heap size.
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
-        int rank = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 3
-                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
-                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? 1 : 0;
-
+    // Usability probe (compute queue + the two memory types we need), factored out so both the
+    // PCI-match pass and the heuristic pass apply exactly the same requirements.
+    auto usable = [](VkPhysicalDevice pd, uint32_t& qi_out,
+                     uint32_t& mt_dev_out, uint32_t& mt_host_out) -> bool {
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qn);
@@ -93,7 +84,7 @@ bool pick_device() {
         uint32_t qi = UINT32_MAX;
         for (uint32_t i = 0; i < qn; ++i)
             if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qi = i; break; }
-        if (qi == UINT32_MAX) continue;
+        if (qi == UINT32_MAX) return false;
 
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(pd, &mp);
@@ -105,12 +96,43 @@ bool pick_device() {
                 (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
                 (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) mt_host = i;
         }
-        if (mt_dev == UINT32_MAX || mt_host == UINT32_MAX) continue;
+        if (mt_dev == UINT32_MAX || mt_host == UINT32_MAX) return false;
+        qi_out = qi; mt_dev_out = mt_dev; mt_host_out = mt_host;
+        return true;
+    };
 
-        VkDeviceSize heap = 0;
-        for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
-            if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                heap = heap > mp.memoryHeaps[i].size ? heap : mp.memoryHeaps[i].size;
+    // Pass 1: bind to the SAME physical device the ggml model backend chose (see
+    // vk_device_pick.h). Keeps --gpu N meaningful for this helper instead of re-ranking.
+    for (auto pd : devs) {
+        if (!vkpick::matches_model_device(pd)) continue;
+        uint32_t qi, mt_dev, mt_host;
+        if (!usable(pd, qi, mt_dev, mt_host)) {
+            fprintf(stderr, "[deform_vk] model device matched but lacks compute/memory support; "
+                            "falling back to the heuristic\n");
+            break;
+        }
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(pd, &props);
+        g.phys = pd; g.qfam = qi; g.mt_dev = mt_dev; g.mt_host = mt_host;
+        vkpick::log_choice("deform_vk", props.deviceName, true);
+        return true;
+    }
+
+    // Pass 2: no usable PCI match (unknown id, or a non-Vulkan ggml backend such as CUDA).
+    // Previous behavior: rank real GPUs first, tie-break by device-local heap size.
+    int best_rank = -1;
+    VkDeviceSize best_heap = 0;
+    char best_name[256] = {0};
+    for (auto pd : devs) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(pd, &props);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
+        const int rank = vkpick::type_rank(props.deviceType);
+
+        uint32_t qi, mt_dev, mt_host;
+        if (!usable(pd, qi, mt_dev, mt_host)) continue;
+
+        const VkDeviceSize heap = vkpick::device_local_heap(pd);
         if (rank > best_rank || (rank == best_rank && heap >= best_heap)) {
             best_rank = rank; best_heap = heap;
             g.phys = pd; g.qfam = qi; g.mt_dev = mt_dev; g.mt_host = mt_host;
@@ -118,7 +140,7 @@ bool pick_device() {
         }
     }
     if (g.phys != VK_NULL_HANDLE)
-        fprintf(stderr, "[deform_vk] using %s\n", best_name);
+        vkpick::log_choice("deform_vk", best_name, false);
     return g.phys != VK_NULL_HANDLE;
 }
 

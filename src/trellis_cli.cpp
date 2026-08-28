@@ -64,6 +64,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     trellis::g_no_fa = cfg.no_fa;
     trellis::g_require_gpu = cfg.require_gpu;
     trellis::g_cpu_threads = cfg.threads;
+    // Publish the requested device so the self-contained GPU helpers (CUDA/HIP decimation,
+    // Vulkan deform + decimation) target the same card as the model instead of each picking
+    // their own. Set before any Model::load so it is live when a helper first initializes.
+    trellis::g_gpu_index = cfg.gpu;
     const std::string& img = cfg.image;
     const std::string& outglb = cfg.output;
     const std::string& M = cfg.models;

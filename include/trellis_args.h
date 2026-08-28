@@ -11,6 +11,18 @@ extern bool g_sparse_cast_f32;  // defined in sparse.cpp        (TRELLIS_F32)
 extern bool g_no_fa;            // defined in dit.cpp           (TRELLIS_NOFA)
 extern bool g_require_gpu;      // defined in trellis_model.cpp (TRELLIS_REQUIRE_GPU)
 extern int  g_cpu_threads;      // defined in trellis_model.cpp (TRELLIS_THREADS)
+// The --gpu index the ggml model backend was created on. The self-contained GPU helpers
+// (CUDA/HIP + Vulkan deformable conv and QEM decimation) build their OWN contexts rather
+// than borrowing ggml's, so without this they each picked a device independently -- on a
+// multi-GPU box that ran the model on one device and the helpers on another. They now
+// resolve this index to the same physical device the model is on. <0 means CPU was
+// requested; helpers still use device 0 in that case, since they have no CPU-side reason
+// to sit idle (the CUDA deform kernel already documented that behavior).
+extern int  g_gpu_index;        // defined in trellis_model.cpp (TRELLIS_GPU)
+// PCI bus id ("domain:bus:device.function") of the device the ggml model backend runs on,
+// or empty if unknown. Lets the Vulkan helpers bind to the same physical adapter even when
+// Vulkan and ggml enumerate devices in different orders.
+extern std::string g_gpu_pci_id;  // defined in trellis_model.cpp
 
 // Every knob for one TRELLIS.2 image->3D run. Resolved as default -> environment
 // (the historical TRELLIS_* / GSS / GSH names) -> CLI flag, with the CLI winning.

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cmath>
 #include <limits>
+#include "trellis_args.h"   // g_gpu_index: bind to the same device as the model backend
 
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
   #include <hip/hip_runtime.h>
@@ -36,6 +37,7 @@
   #define gpuGetLastError         hipGetLastError
   #define gpuGetErrorString       hipGetErrorString
   #define gpuGetDeviceCount       hipGetDeviceCount
+  #define gpuSetDevice            hipSetDevice
 #else
   #include <cuda_runtime.h>
   #include <cub/cub.cuh>
@@ -56,6 +58,7 @@
   #define gpuGetLastError         cudaGetLastError
   #define gpuGetErrorString       cudaGetErrorString
   #define gpuGetDeviceCount       cudaGetDeviceCount
+  #define gpuSetDevice            cudaSetDevice
 #endif
 
 // ROCm's clang marks hip runtime calls [[nodiscard]]; the buffer teardown paths below
@@ -109,6 +112,26 @@ __global__ void k_fill_v2f(const int3* faces, int F, int* v2f, const int* off, i
     v2f[off[f.x] + atomicAdd(&cnt[f.x], 1)] = t;
     v2f[off[f.y] + atomicAdd(&cnt[f.y], 1)] = t;
     v2f[off[f.z] + atomicAdd(&cnt[f.z], 1)] = t;
+}
+// Sort each vertex's incident-face segment into ascending face id. REQUIRED for determinism:
+// k_fill_v2f places faces in atomicAdd ARRIVAL order, so the same mesh produced a different v2f
+// permutation on every run. k_qem then summed the 10 quadric floats in a run-varying order and
+// fp32 addition is not associative, so qem[] differed in the last bits, cost[] differed by an ULP,
+// and (because the edge index is the tie-break in the packed cost) a different independent set
+// collapsed -- i.e. the CUDA decimator was nondeterministic run-to-run on identical input.
+// Ascending face id also matches the serial `cur[v]++` fill in decimate_qem.cpp /
+// decimate_qem_vk.cpp, so all three backends now accumulate in the same order.
+// Vertex degrees are small (~6 on a dual-contoured mesh), so an in-place insertion sort per
+// thread is cheaper than a segmented sort.
+__global__ void k_sort_v2f(const int* off, int Vn, int* v2f) {
+    int t = blockIdx.x*blockDim.x + threadIdx.x; if (t >= Vn) return;
+    const int b = off[t], e = off[t+1];
+    for (int i = b + 1; i < e; ++i) {
+        const int key = v2f[i];
+        int j = i - 1;
+        while (j >= b && v2f[j] > key) { v2f[j+1] = v2f[j]; --j; }
+        v2f[j+1] = key;
+    }
 }
 __global__ void k_expand_edges(const int3* faces, int F, uint64_t* edges) {
     int t = blockIdx.x*blockDim.x + threadIdx.x; if (t >= F) return;
@@ -218,9 +241,13 @@ __global__ void k_collapse(float3* V, int3* faces, const uint64_t* edges, const 
     }
     for (int j = off[e1]; j < off[e1+1]; ++j) {
         int fid = v2f[j]; int3 fv = faces[fid];
-        if      (fv.x == e1) fv.x = e0;
-        else if (fv.y == e1) fv.y = e0;
-        else if (fv.z == e1) fv.z = e0;
+        // Retarget EVERY slot that references e1, not just the first. The old `else if` chain
+        // left a stale e1 behind on a face that references e1 twice (dual contouring can emit
+        // such degenerate faces), which diverged from the 3-slot loops in decimate_qem.cpp and
+        // decimate_qem.comp and left the adjacency inconsistent for later rounds.
+        if (fv.x == e1) fv.x = e0;
+        if (fv.y == e1) fv.y = e0;
+        if (fv.z == e1) fv.z = e0;
         faces[fid] = fv;                                                 // retarget e1 -> e0
     }
 }
@@ -295,6 +322,8 @@ static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
     if (!cub_exclusive_sum(d_cnt, d_off, V + 1, s)) return false;
     GPU_OK(gpuMemsetAsync(d_cnt, 0, sizeof(int) * (size_t)(V + 1), s));
     k_fill_v2f<<<NB(F), BLK, 0, s>>>(d_faces, F, d_v2f, d_off, d_cnt);
+    GPU_LAST();
+    k_sort_v2f<<<NB(V), BLK, 0, s>>>(d_off, V, d_v2f);   // determinism: ascending face id per vertex
     GPU_LAST();
 
     // --- unique undirected edges + counts ---
@@ -414,6 +443,21 @@ bool decimate_qem_gpu(const std::vector<float>& in_verts, int V0,
                       int target_faces, std::vector<float>& ov, std::vector<int32_t>& of) {
     int devcount = 0;
     if (gpuGetDeviceCount(&devcount) != gpuSuccess || devcount <= 0) return false;
+    // Bind to the SAME device the model backend is on. Without this the decimator always ran on
+    // device 0 while `--gpu 1` put the model on device 1 -- wrong device, and VRAM pressure on a
+    // card the user did not select. g_gpu_index < 0 means CPU was requested for the model; the
+    // decimator still uses device 0 then (same rule the deform kernel has always used).
+    {
+        int want = g_gpu_index < 0 ? 0 : g_gpu_index;
+        if (want >= devcount) {
+            fprintf(stderr, "[decimate_gpu] --gpu %d out of range (%d device(s)); using 0\n", want, devcount);
+            want = 0;
+        }
+        if (gpuSetDevice(want) != gpuSuccess) {
+            fprintf(stderr, "[decimate_gpu] cannot select device %d; CPU fallback\n", want);
+            return false;
+        }
+    }
     if (V0 <= 0 || F0 <= 0) return false;
     if (F0 <= target_faces) { ov = in_verts; of = in_faces; return true; }
 

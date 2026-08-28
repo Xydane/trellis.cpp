@@ -14,6 +14,7 @@
 #include "uv_bake.h"
 
 #include <vulkan/vulkan.h>
+#include "vk_device_pick.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -140,6 +141,26 @@ bool pick_device() {
     std::vector<VkPhysicalDevice> devs(n);
     vkEnumeratePhysicalDevices(g.instance, &n, devs.data());
 
+    // Pass 1: bind to the SAME physical device the ggml model backend chose (vk_device_pick.h),
+    // so --gpu N is honored here instead of this helper re-ranking independently. device_usable()
+    // still gates on 64-bit atomics; if the model's device lacks them we fall through to the
+    // heuristic, and then to the CPU path if nothing qualifies.
+    for (auto pd : devs) {
+        if (!vkpick::matches_model_device(pd)) continue;
+        uint32_t qi, mt_dev, mt_host; bool has_ext;
+        if (!device_usable(pd, qi, mt_dev, mt_host, has_ext)) {
+            fprintf(stderr, "[decimate_vk] model device matched but lacks 64-bit atomics or a "
+                            "compute queue; falling back to the heuristic\n");
+            break;
+        }
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(pd, &props);
+        g.phys = pd; g.qfam = qi; g.mt_dev = mt_dev; g.mt_host = mt_host; g.has_atomic_ext = has_ext;
+        vkpick::log_choice("decimate_vk", props.deviceName, true);
+        return true;
+    }
+
+    // Pass 2: previous behavior -- rank real GPUs first, tie-break by device-local heap size.
     int best_rank = -1;
     VkDeviceSize best_heap = 0;
     char best_name[256] = {0};
@@ -153,15 +174,8 @@ bool pick_device() {
         uint32_t qi, mt_dev, mt_host; bool has_ext;
         if (!device_usable(pd, qi, mt_dev, mt_host, has_ext)) continue;
 
-        int rank = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 3
-                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
-                 : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? 1 : 0;
-        VkPhysicalDeviceMemoryProperties mp;
-        vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-        VkDeviceSize heap = 0;
-        for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
-            if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                heap = heap > mp.memoryHeaps[i].size ? heap : mp.memoryHeaps[i].size;
+        const int rank = vkpick::type_rank(props.deviceType);
+        const VkDeviceSize heap = vkpick::device_local_heap(pd);
         if (rank > best_rank || (rank == best_rank && heap >= best_heap)) {
             best_rank = rank; best_heap = heap;
             g.phys = pd; g.qfam = qi; g.mt_dev = mt_dev; g.mt_host = mt_host; g.has_atomic_ext = has_ext;
@@ -169,7 +183,7 @@ bool pick_device() {
         }
     }
     if (g.phys != VK_NULL_HANDLE)
-        fprintf(stderr, "[decimate_vk] using %s\n", best_name);
+        vkpick::log_choice("decimate_vk", best_name, false);
     return g.phys != VK_NULL_HANDLE;
 }
 
@@ -299,10 +313,22 @@ bool simplify_round_vk(std::vector<float>& verts, int& V, std::vector<int32_t>& 
     std::vector<int32_t> boundary((size_t)V, 0);
     std::vector<int32_t> edges;                        // E*2, packed (e0,e1) with e0<e1
     edges.reserve(ecount.size() * 2);
+    // Sort by the packed key before expanding to (e0,e1) pairs. LOAD-BEARING for cross-backend
+    // reproducibility: the edge INDEX is the tie-break in the shader's pack_cost (cost<<32|id),
+    // and exact cost ties are the norm at thresh=1e-8 on a dual-contoured mesh. Iterating
+    // `ecount` gave hash-bucket order, so this path picked a different independent set than the
+    // CUDA path (whose cub radix sort already yields ascending packed order); the meshes then
+    // diverged structurally. Matches the identical sort in decimate_qem.cpp.
+    std::vector<uint64_t> ekeys; ekeys.reserve(ecount.size());
     for (auto& kv : ecount) {
         int a = (int)(kv.first >> 32), b = (int)(kv.first & 0xffffffffu);
         if (kv.second == 1) { boundary[a] = boundary[b] = 1; }
-        edges.push_back(a); edges.push_back(b);
+        ekeys.push_back(kv.first);
+    }
+    std::sort(ekeys.begin(), ekeys.end());
+    for (uint64_t k : ekeys) {
+        edges.push_back((int)(k >> 32));
+        edges.push_back((int)(k & 0xffffffffu));
     }
     const int E = (int)edges.size() / 2;
 

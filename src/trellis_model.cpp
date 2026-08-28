@@ -34,6 +34,21 @@ namespace trellis {
 
 bool g_require_gpu = false;   // --require-gpu; set by trellis_run
 int  g_cpu_threads = 0;       // --threads; 0 = all cores. Set by trellis_run.
+int  g_gpu_index = 0;         // --gpu; set by trellis_run. Read by the self-contained GPU helpers.
+
+// PCI bus id ("domain:bus:device.function") of the device the model backend was created on,
+// as reported by ggml. Empty when unknown. The self-contained Vulkan helpers use this to bind
+// to the SAME physical device instead of running their own "best GPU" ranking; matching on the
+// bus id is robust to Vulkan and ggml enumerating adapters in different orders.
+std::string g_gpu_pci_id;
+
+static void record_device_identity(ggml_backend_dev_t d) {
+    ggml_backend_dev_props pr{};
+    ggml_backend_dev_get_props(d, &pr);
+    g_gpu_pci_id = pr.device_id ? pr.device_id : "";
+    if (!g_gpu_pci_id.empty())
+        fprintf(stderr, "[trellis] model device PCI id %s\n", g_gpu_pci_id.c_str());
+}
 
 // ggml_backend_cpu_init() leaves the backend on ggml's built-in default thread
 // count, so most of a multi-core box sits idle on the CPU path. Measured on one
@@ -66,7 +81,14 @@ static ggml_backend* make_backend(int gpu) {
 #ifdef TRELLIS_USE_CUDA
     {
         ggml_backend* b = ggml_backend_cuda_init(gpu);
-        if (b) return b;
+        if (b) {
+            // Record the identity so the custom CUDA kernels can be cross-checked against the
+            // device the model actually landed on. (They bind by g_gpu_index, which is the same
+            // ordinal ggml_backend_cuda_init() takes, so this is diagnostic rather than load-bearing
+            // on CUDA -- it is the Vulkan helpers that match on the PCI id.)
+            if (ggml_backend_dev_t d = ggml_backend_get_device(b)) record_device_identity(d);
+            return b;
+        }
         fprintf(stderr, "[trellis] CUDA init failed on device %d\n", gpu);
     }
 #endif
@@ -103,6 +125,7 @@ static ggml_backend* make_backend(int gpu) {
         if (chosen) {
             ggml_backend* b = ggml_backend_dev_init(chosen, nullptr);
             if (b) {
+                record_device_identity(chosen);
                 fprintf(stderr, "[trellis] using %s (%zu MB)\n", ggml_backend_name(b), chosen_mem / (1024 * 1024));
                 return b;
             }
