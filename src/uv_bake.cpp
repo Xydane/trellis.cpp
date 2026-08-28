@@ -527,9 +527,21 @@ int fill_holes(std::vector<float>& verts, std::vector<int32_t>& faces, float max
     int filled = 0;
     std::unordered_map<int,char> visited;
     std::vector<int> loop;
-    for (auto& kv : nxt) {
-        const int start = kv.first;
-        if (kv.second == INT32_MIN || visited.count(start)) continue;
+    // Loop STARTS must be visited in a canonical order. `visited` claims every vertex of each
+    // loop as it is consumed, so at a non-manifold junction the traversal order decides which
+    // loops are found at all -- and the fill then appends centroid vertices and faces in that
+    // order. Iterating `nxt` directly gave std::unordered_map bucket order, which is unspecified
+    // and shifts with the STL and the insertion history, so the same mesh produced different
+    // output (and different vertex numbering) across platforms and feeds every downstream stage,
+    // since fill_holes runs before remesh + decimation. Same defect class as the edge ordering
+    // fixed in decimate_qem.cpp; sort the start vertices to make it a function of the mesh.
+    std::vector<int> starts;
+    starts.reserve(nxt.size());
+    for (const auto& kv : nxt) starts.push_back(kv.first);
+    std::sort(starts.begin(), starts.end());
+    for (int start : starts) {
+        const auto sit = nxt.find(start);
+        if (sit == nxt.end() || sit->second == INT32_MIN || visited.count(start)) continue;
         loop.clear();
         int cur = start; bool ok = true;
         double perim = 0.0;
@@ -580,19 +592,26 @@ void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
         for (int k = 0; k < 3; ++k) euse[ekey(t[k], t[(k+1)%3])]++;
     }
     // CSR adjacency (each edge contributes both directions) + boundary flags
+    // Built from a SORTED key list, not `euse` bucket order: the neighbour lists feed an fp32
+    // umbrella sum below, and fp32 addition is not associative, so bucket order perturbed every
+    // smoothed vertex position (measured: ~49% of 6-neighbour sums change under reordering).
+    std::vector<uint64_t> ekeys;
+    ekeys.reserve(euse.size());
+    for (const auto& kv : euse) ekeys.push_back(kv.first);
+    std::sort(ekeys.begin(), ekeys.end());
     std::vector<int> deg((size_t)V, 0);
     std::vector<uint8_t> boundary((size_t)V, 0);
-    for (auto& kv : euse) {
-        int a = (int)(kv.first >> 32), b = (int)(kv.first & 0xffffffffu);
+    for (uint64_t k : ekeys) {
+        int a = (int)(k >> 32), b = (int)(k & 0xffffffffu);
         deg[a]++; deg[b]++;
-        if (kv.second == 1) { boundary[a] = boundary[b] = 1; }
+        if (euse.find(k)->second == 1) { boundary[a] = boundary[b] = 1; }
     }
     std::vector<int> off((size_t)V + 1, 0);
     for (int i = 0; i < V; ++i) off[i+1] = off[i] + deg[i];
     std::vector<int> nbr((size_t)off[V]);
     std::vector<int> cur(off.begin(), off.end() - 1);
-    for (auto& kv : euse) {
-        int a = (int)(kv.first >> 32), b = (int)(kv.first & 0xffffffffu);
+    for (uint64_t k : ekeys) {
+        int a = (int)(k >> 32), b = (int)(k & 0xffffffffu);
         nbr[cur[a]++] = b; nbr[cur[b]++] = a;
     }
     std::vector<float> tmp(verts.size());
@@ -610,6 +629,13 @@ void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
     for (int it = 0; it < iters; ++it) { step(lambda); step(mu); }
 }
 
+// Fills boundary loops by fanning from loop[0]. NOTE ON DETERMINISM: this takes only `faces`,
+// so it has no vertex positions to anchor the fan geometrically -- loop[0] is the lowest VERTEX
+// LABEL in the cycle. That makes the output a deterministic function of the index buffer (which
+// is what the pipeline needs, and what the sorted iteration below guarantees), but it is not
+// invariant to relabeling the same mesh: on a quad hole, anchoring at a different corner picks
+// the other diagonal. Equal-area, equal-count, different triangulation. Callers that need
+// relabel-invariance must canonicalize vertex order upstream.
 int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
     const size_t F = faces.size() / 3;
     auto ekey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
@@ -633,7 +659,14 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
     std::unordered_map<int, bool> used;
     int filled = 0;
     size_t added = 0;
-    for (const auto& [start, first] : nxt) {
+    // Canonical start order -- see the comment in fill_holes(). `used` claims each loop's
+    // vertices, so bucket order changed which loops were found and the order faces were
+    // appended in.
+    std::vector<int> starts;
+    starts.reserve(nxt.size());
+    for (const auto& kv : nxt) starts.push_back(kv.first);
+    std::sort(starts.begin(), starts.end());
+    for (int start : starts) {
         if (used[start] || outd[start] != 1 || ind[start] != 1) continue;
         std::vector<int> loop = {start};
         int cur = start;
@@ -673,8 +706,21 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
             const int a = (int)(k >> 32), b = (int)(uint32_t)k;
             adj[a].push_back(b); adj[b].push_back(a);
         }
+        // Two orderings matter here. The per-vertex neighbour LISTS are appended in `und` bucket
+        // order, and the walk below seeds itself with nbrs[0] -- so bucket order chose which of
+        // the two rim directions the loop was traversed in, which reverses the emitted triangle
+        // winding. Sorting each list fixes the direction; sorting the starts fixes which loops
+        // are found (used2 claims vertices as loops are consumed).
+        for (auto& kv : adj) std::sort(kv.second.begin(), kv.second.end());
+        std::vector<int> starts2;
+        starts2.reserve(adj.size());
+        for (const auto& kv : adj) starts2.push_back(kv.first);
+        std::sort(starts2.begin(), starts2.end());
         std::unordered_map<int, bool> used2;
-        for (const auto& [start, nbrs] : adj) {
+        for (int start : starts2) {
+            const auto ait = adj.find(start);
+            if (ait == adj.end()) continue;
+            const std::vector<int>& nbrs = ait->second;
             if (used2[start] || nbrs.size() != 2) continue;
             std::vector<int> loop = {start};
             int prev = start, cur = nbrs[0];
